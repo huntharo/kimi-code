@@ -1,0 +1,194 @@
+name: Build PwrAgent Kimi Code distribution
+
+# Fork-only build that produces an installable Kimi Code CLI tarball for
+# testing against PwrAgent. Every workflow shipped by the upstream repo is
+# gated on `repository_owner == 'MoonshotAI'`, so a fork gets no artifacts of
+# its own; this fills that gap and is gated on the fork owner so it stays inert
+# if the branch is ever taken upstream.
+#
+# The CLI publishes as ONE platform-independent npm package: the darwin/win32
+# native helpers ship as committed prebuilds under `packages/pi-tui/native`,
+# and the browser UI ships as the committed `apps/kimi-code/dist-web` bundle.
+# So a single Linux job produces a complete, cross-platform artifact — no build
+# matrix is needed.
+
+on:
+  workflow_dispatch:
+  # Build every downstream PR too, so a branch can be installed and tested
+  # before it is merged — the tarball lands as an artifact on the PR's run.
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "pwragent-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pwragent-kimi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build CLI tarball
+    if: github.repository_owner == 'huntharo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # A tag build takes its version verbatim; every other run gets a
+      # prerelease suffix so a locally installed dev build can never be
+      # confused with a published release.
+      - name: Resolve downstream version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_version="$(node -p "require('./apps/kimi-code/package.json').version")"
+          if [[ "$GITHUB_REF" == refs/tags/pwragent-v* ]]; then
+            version="${GITHUB_REF_NAME#pwragent-v}"
+          else
+            version="${upstream_version}-pwragent.dev.${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Resolved version is not SemVer: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the downstream version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = "apps/kimi-code/package.json";
+            const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+          '
+
+      # Public fetch of models.dev — no secrets, so it works on a fork. Matches
+      # what the upstream release/preview workflows inline into the build.
+      - name: Generate Kimi Code built-in catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          CATALOG_FILE="$RUNNER_TEMP/kimi-code-built-in-catalog.json"
+          node apps/kimi-code/scripts/update-catalog.mjs --out "$CATALOG_FILE"
+          echo "KIMI_CODE_BUILT_IN_CATALOG_FILE=$CATALOG_FILE" >> "$GITHUB_ENV"
+
+      - name: Build package dependencies
+        run: pnpm run build:packages
+
+      - name: Build Kimi Code package
+        run: pnpm --filter @moonshot-ai/kimi-code run build
+
+      - name: Smoke test CLI bundle
+        run: pnpm -C apps/kimi-code run smoke
+
+      # Proves the ACP entry point starts and speaks the protocol before the
+      # artifact is published — an `initialize` round trip needs no credentials.
+      - name: Smoke test ACP entry point
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$(
+            printf '%s\n' \
+              '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' \
+              | node apps/kimi-code/dist/main.mjs acp
+          )"
+          echo "$response"
+          node -e '
+            const line = process.argv[1];
+            const message = JSON.parse(line);
+            if (message.error) throw new Error(`initialize failed: ${JSON.stringify(message.error)}`);
+            if (typeof message.result?.protocolVersion !== "number") {
+              throw new Error("initialize response carried no protocolVersion");
+            }
+          ' "$response"
+
+      - name: Pack the CLI
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-artifact
+          cd apps/kimi-code
+          tarball="$(npm pack --pack-destination ../../dist-artifact | tail -n 1)"
+          cd ../..
+          test -f "dist-artifact/${tarball}"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+
+      - name: Write build metadata
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > dist-artifact/PWRAGENT-BUILD.txt <<EOF
+          version=${VERSION}
+          tarball=${TARBALL}
+          source_repository=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          source_ref=${GITHUB_REF}
+          source_commit=${GITHUB_SHA}
+          EOF
+          cd dist-artifact
+          sha256sum "${TARBALL}" > SHA256SUMS
+
+      - name: Upload CLI tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: kimi-code-${{ steps.version.outputs.version }}
+          path: dist-artifact
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: github.repository_owner == 'huntharo' && startsWith(github.ref, 'refs/tags/pwragent-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          pattern: kimi-code-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $RELEASE_TAG already exists; downstream assets are immutable." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --title "PwrAgent Kimi Code ${RELEASE_TAG#pwragent-v}" \
+            --notes "Downstream Kimi Code CLI build for PwrAgent. Source commit: ${GITHUB_SHA}."
