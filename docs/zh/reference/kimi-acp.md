@@ -53,7 +53,7 @@ kimi acp
 
 | 方法 | 状态 | 说明 |
 | --- | --- | --- |
-| `session/update` | 是 | 流式推送 `agent_message_chunk` / `tool_call*` / `plan` / `config_option_update` / `available_commands_update` |
+| `session/update` | 是 | 流式推送 `agent_message_chunk` / `tool_call*` / `plan` / `config_option_update` / `available_commands_update` / `usage_update` |
 | `session/request_permission` | 是 | 工具审批和问题 elicitation 共用此通道 |
 | `fs/read_text_file` | 是 | kaos 层文件读取路由到客户端（通过 `fsCapabilities` 公告） |
 | `fs/write_text_file` | 是 | kaos 层文件写入路由到客户端 |
@@ -67,6 +67,21 @@ kimi acp
 | 其余 18 个方法 | 否 | 包括 session 生命周期扩展、缓冲区同步、inline-edit 预测、provider 管理等 |
 
 上述未列出的方法一律返回 `methodNotFound`。
+
+## Token 用量上报
+
+这些数字来自模型 API 自身的计数器——kimi 上报的是 provider 返回的值，不是本地估算。
+
+turn 运行期间，每次模型调用完成都会推送一条 `usage_update` 的 `session/update`：
+
+- `used` / `size` — 当前上下文中的 token 数与所绑定模型的上下文窗口大小，用于实时的上下文进度条。
+- `_meta.usage` — **当前 turn** 的累计 token（`inputTokens`、`outputTokens`、`cachedReadTokens`、`cachedWriteTokens`、`totalTokens`），采用 ACP 的 `Usage` 结构；每个 turn 边界处重置。
+- `_meta.sessionUsage` — 同样的明细，但从会话创建起累计。
+- `_meta.model` — 这些计数所对应的模型。
+
+`cost` 始终不设置：kimi 只跟踪 token，不跟踪价格。
+
+turn 结束时，`session/prompt` 的响应会在 `usage` 上带回该 turn 的最终总量，因此忽略流式通知的客户端每个 turn 仍能拿到一次读数。
 
 ## MCP 转发
 

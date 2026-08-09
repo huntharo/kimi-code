@@ -18,10 +18,12 @@ export {
 } from './convert';
 export {
   acpToolCallId,
+  agentStatusToUsageUpdate,
   assistantDeltaToSessionUpdate,
   inferToolKind,
   stringifyArgs,
   thinkingDeltaToSessionUpdate,
+  tokenUsageToAcpUsage,
   toolCallDeltaToSessionUpdate,
   toolCallLazyCreateToSessionUpdate,
   toolCallStartedUpgradeToSessionUpdate,
@@ -30,6 +32,7 @@ export {
   toolResultToSessionUpdate,
   turnEndReasonToStopReason,
 } from './events-map';
+export type { AcpUsageUpdateMeta } from './events-map';
 export type { AcpStopReason, AcpToolCallStatus, AcpToolKind } from './types';
 export { HideOutputMarker, isHideOutputMarker } from './marker';
 export { redirectConsoleToStderr } from './log-guard';
