@@ -9,7 +9,9 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   ToolKind,
+  Usage,
 } from '@agentclientprotocol/sdk';
+import type { UsageStatus } from '@moonshot-ai/klient';
 import type {
   AssistantDeltaEvent,
   ThinkingDeltaEvent,
@@ -497,15 +499,65 @@ export function configOptionUpdateNotification(
 }
 
 /**
- * Build a one-shot `usage_update` session notification, emitted after a turn
- * settles. `used` is the agent's current context token count, `size` the bound
- * model's max context size; `cost` stays omitted (the engine has no cost
- * data).
+ * Project the engine's `TokenUsage` onto the ACP `Usage` shape.
+ *
+ * Every field is a provider-reported counter, not a local estimate: the
+ * numbers originate in the model API response body (`usage.prompt_tokens` /
+ * `completion_tokens` / `prompt_tokens_details.cached_tokens` for the
+ * OpenAI-shaped wire, `input_tokens` / `output_tokens` /
+ * `cache_read_input_tokens` / `cache_creation_input_tokens` for the
+ * Anthropic-shaped one), get normalized by the provider adapter, and are
+ * accumulated by the engine's usage service without ever being synthesized.
+ *
+ * `thoughtTokens` is deliberately omitted: no provider the engine supports
+ * reports reasoning tokens as a counter separate from `output`, so emitting a
+ * value would either double-count the output or report a fabricated zero.
+ */
+export function tokenUsageToAcpUsage(usage: NonNullable<UsageStatus['total']>): Usage {
+  return {
+    inputTokens: usage.inputOther,
+    outputTokens: usage.output,
+    cachedReadTokens: usage.inputCacheRead,
+    cachedWriteTokens: usage.inputCacheCreation,
+    totalTokens:
+      usage.inputOther + usage.output + usage.inputCacheRead + usage.inputCacheCreation,
+  };
+}
+
+/**
+ * Extra detail carried on `usage_update._meta`.
+ *
+ * ACP's `UsageUpdate` only models the context window (`used` / `size`) plus an
+ * optional monetary `cost`, so the token breakdown a client needs to price a
+ * turn has no standard home. `_meta` is the protocol's designated extension
+ * slot, and the payloads inside it reuse ACP's own `Usage` shape rather than
+ * inventing a vendor encoding.
+ *
+ * `usage` is the running total for the CURRENT TURN (it resets at every turn
+ * boundary and grows as the turn's model calls land); `sessionUsage` is the
+ * cumulative total since the session was created. Both are emitted together so
+ * a client never has to guess which scope a bare total belongs to.
+ */
+export interface AcpUsageUpdateMeta {
+  readonly model?: string;
+  readonly usage?: Usage;
+  readonly sessionUsage?: Usage;
+}
+
+/**
+ * Build a `usage_update` session notification. `used` is the agent's current
+ * context token count, `size` the bound model's max context size; `cost` stays
+ * omitted (the engine tracks tokens, not prices, and a fabricated amount is
+ * worse for a client than an absent one).
+ *
+ * Emitted live as the engine reports fresh token counts during a turn, and
+ * once more when the turn settles.
  */
 export function usageUpdateNotification(
   sessionId: string,
   used: number,
   size: number,
+  meta?: AcpUsageUpdateMeta,
 ): SessionNotification {
   return {
     sessionId,
@@ -513,6 +565,7 @@ export function usageUpdateNotification(
       sessionUpdate: 'usage_update',
       used,
       size,
+      _meta: meta === undefined ? undefined : { ...meta },
     },
   };
 }

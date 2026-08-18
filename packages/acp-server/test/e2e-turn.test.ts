@@ -20,9 +20,18 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
-import { writeFakeModelConfig } from './_helpers/fakeModelConfig';
+import { FAKE_MODEL_ID, writeFakeModelConfig } from './_helpers/fakeModelConfig';
 import { solidPngBase64 } from './_helpers/png';
 import { createScriptedProvider, type ScriptedProvider } from './_helpers/scriptedProvider';
+
+/** ACP `Usage` as it arrives on the wire (every field optional). */
+type WireUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  totalTokens?: number;
+};
 
 /** Real stdio MCP fixture server from the agent-core-v2 test suite. */
 const STDIO_MCP_FIXTURE = fileURLToPath(
@@ -88,21 +97,110 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     const update = (chunk.params as { update?: { content?: { text?: string } } }).update;
     expect(update?.content?.text).toContain('hello from the scripted model');
 
-    const result = (await promptPromise) as { stopReason: string };
+    const result = (await promptPromise) as {
+      stopReason: string;
+      usage?: WireUsage;
+    };
     expect(result.stopReason).toBe('end_turn');
     expect(scripted!.callCount()).toBe(1);
 
-    // Turn settlement pushes a one-shot usage_update: `used` is the
-    // LLM-measured context token count (the scripted provider reports
-    // output usage only, so > 0), `size` the fake model's max context
-    // size (8192, see fakeModelConfig); `cost` stays omitted.
+    // The turn's provider-reported token total rides on the prompt
+    // response. The scripted provider reports output tokens only, so the
+    // input counters are zero and `totalTokens` equals the output count.
+    expect(result.usage).toMatchObject({
+      inputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    });
+    expect(result.usage?.outputTokens).toBeGreaterThan(0);
+    expect(result.usage?.totalTokens).toBe(result.usage?.outputTokens);
+
+    // The turn also pushes a usage_update: `used` is the LLM-measured
+    // context token count (> 0), `size` the fake model's max context size
+    // (8192, see fakeModelConfig); `cost` stays omitted, and `_meta`
+    // carries the token breakdown ACP's UsageUpdate has no field for.
     const usage = await c.waitForSessionUpdate('usage_update', 10_000);
     const usageUpdate = (
-      usage.params as { update?: { used?: number; size?: number; cost?: unknown } }
+      usage.params as {
+        update?: {
+          used?: number;
+          size?: number;
+          cost?: unknown;
+          _meta?: {
+            model?: string;
+            usage?: WireUsage;
+            sessionUsage?: WireUsage;
+          };
+        };
+      }
     ).update;
     expect(usageUpdate?.size).toBe(8192);
     expect(usageUpdate?.used).toBeGreaterThan(0);
     expect(usageUpdate?.cost).toBeUndefined();
+    expect(usageUpdate?._meta?.model).toBe(FAKE_MODEL_ID);
+    expect(usageUpdate?._meta?.usage?.outputTokens).toBeGreaterThan(0);
+    expect(usageUpdate?._meta?.sessionUsage?.outputTokens).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('streams a usage_update per model call, with a per-turn running total', async () => {
+    const c = await boot();
+    // Two model calls in one turn: a tool call, then the post-tool wrap-up.
+    // Each reports its own usage, so the turn total must grow across them.
+    scripted!.mockNextResponse({
+      type: 'function',
+      id: 'call_1',
+      name: 'Bash',
+      arguments: '{"command":"echo hi"}',
+    });
+    scripted!.mockNextText('done with the tool');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+
+    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
+      sessionId: string;
+    };
+    await c.waitForSessionUpdate('available_commands_update', 10_000);
+
+    const result = (await c.send('session/prompt', {
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'run echo' }],
+    })) as { stopReason: string; usage?: WireUsage };
+    expect(result.stopReason).toBe('end_turn');
+    expect(scripted!.callCount()).toBe(2);
+
+    // `session/update` notifications are fire-and-forget, so the last ones
+    // can still be in flight when the prompt response lands.
+    await c.waitForSessionUpdate('usage_update', 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    type UsageUpdate = {
+      sessionUpdate?: string;
+      used?: number;
+      size?: number;
+      _meta?: { usage?: WireUsage };
+    };
+    const updates = c
+      .sessionUpdates()
+      .map((m) => (m.params as { update?: UsageUpdate }).update)
+      .filter((u): u is UsageUpdate => u?.sessionUpdate === 'usage_update');
+
+    // One per model call — the meter moves while the turn is still running
+    // rather than only once at settlement.
+    expect(updates.length).toBeGreaterThanOrEqual(2);
+    // No two consecutive updates repeat the same payload (the dedupe keeps
+    // usage-free status slices from repainting the meter).
+    for (let i = 1; i < updates.length; i += 1) {
+      expect(JSON.stringify(updates[i])).not.toBe(JSON.stringify(updates[i - 1]));
+    }
+    // The `_meta.usage` running total is monotonic within the turn, and the
+    // last one matches what the prompt response reports.
+    const totals = updates.map((u) => u._meta?.usage?.totalTokens ?? 0);
+    for (let i = 1; i < totals.length; i += 1) {
+      expect(totals[i]!).toBeGreaterThanOrEqual(totals[i - 1]!);
+    }
+    expect(totals[totals.length - 1]).toBe(result.usage?.totalTokens);
+    expect(result.usage?.totalTokens).toBeGreaterThan(0);
   }, 30_000);
 
   it('runs a tool call and bridges the approval request to the client', async () => {

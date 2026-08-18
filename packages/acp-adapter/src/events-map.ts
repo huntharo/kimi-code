@@ -6,10 +6,13 @@ import type {
   SessionNotification,
   ToolCallContent,
   ToolKind,
+  Usage,
 } from '@agentclientprotocol/sdk';
 import type {
+  AgentStatusUpdatedEvent,
   AssistantDeltaEvent,
   ThinkingDeltaEvent,
+  TokenUsage,
   ToolCallDeltaEvent,
   ToolCallStartedEvent,
   ToolInputDisplay,
@@ -522,6 +525,117 @@ export function configOptionUpdateNotification(
     update: {
       sessionUpdate: 'config_option_update',
       configOptions: [...configOptions],
+    },
+  };
+}
+
+/**
+ * Project the SDK's {@link TokenUsage} onto the ACP `Usage` shape.
+ *
+ * Every field is a provider-reported counter, not a local estimate: the
+ * numbers originate in the model API response body
+ * (`usage.prompt_tokens` / `completion_tokens` /
+ * `prompt_tokens_details.cached_tokens` for the OpenAI-shaped wire, and
+ * `input_tokens` / `output_tokens` / `cache_read_input_tokens` /
+ * `cache_creation_input_tokens` for the Anthropic-shaped one), get
+ * normalized by the provider adapter, and are accumulated by the
+ * engine's usage service without ever being synthesized.
+ *
+ * Field mapping (`TokenUsage` → ACP `Usage`):
+ *  - `inputOther`         → `inputTokens` (uncached prompt tokens),
+ *  - `output`             → `outputTokens`,
+ *  - `inputCacheRead`     → `cachedReadTokens`,
+ *  - `inputCacheCreation` → `cachedWriteTokens`,
+ *  - the sum of all four  → `totalTokens`.
+ *
+ * `thoughtTokens` is deliberately omitted: no provider the engine
+ * supports reports reasoning tokens as a counter separate from
+ * `output`, so emitting a value would either double-count the output
+ * or report a fabricated zero.
+ */
+export function tokenUsageToAcpUsage(usage: TokenUsage): Usage {
+  return {
+    inputTokens: usage.inputOther,
+    outputTokens: usage.output,
+    cachedReadTokens: usage.inputCacheRead,
+    cachedWriteTokens: usage.inputCacheCreation,
+    totalTokens:
+      usage.inputOther + usage.output + usage.inputCacheRead + usage.inputCacheCreation,
+  };
+}
+
+/**
+ * Extra detail carried on `usage_update._meta`.
+ *
+ * ACP's `UsageUpdate` only models the context window (`used` / `size`)
+ * plus an optional monetary `cost`, so the token breakdown that clients
+ * need to price a turn has no standard home. `_meta` is the protocol's
+ * designated extension slot, and the payloads inside it reuse ACP's own
+ * `Usage` shape rather than inventing a vendor encoding.
+ *
+ * `usage` is the running total for the CURRENT TURN (it resets at every
+ * turn boundary and grows as the turn's model calls land), while
+ * `sessionUsage` is the cumulative total since the session was created.
+ * Both are always present together so a client never has to guess which
+ * scope a bare total belongs to.
+ */
+export interface AcpUsageUpdateMeta {
+  readonly model?: string;
+  readonly usage?: Usage;
+  readonly sessionUsage?: Usage;
+}
+
+/**
+ * Build an ACP `usage_update` session notification from an SDK
+ * `agent.status.updated` event, or return `null` when the event does
+ * not carry a usable context-window reading.
+ *
+ * Each `agent.status.updated` carries the engine's COMBINED status
+ * payload — usage, context tokens, context limit and model together,
+ * re-read at emit time — so a single event is enough to build the
+ * update. One lands after every model call, which is what makes the
+ * meter live rather than a single reading at turn end.
+ *
+ * The context limit is nonetheless optional on the wire, and ACP's
+ * `size` is a required number with no "unknown" encoding, so an event
+ * without one is dropped rather than published as a `0` window that
+ * would render as a full or broken meter.
+ *
+ * `used` / `size` map to `contextTokens` / `maxContextTokens`:
+ *  - `contextTokens` is the engine's externally reported context size.
+ *    Under the default `measured+estimated` token-counting strategy it
+ *    is the last provider-measured total, floored against a live
+ *    character-based estimate of any messages appended since — so it
+ *    tracks the real window and never reports less than the API last
+ *    charged for.
+ *  - `maxContextTokens` is the bound model's declared context limit
+ *    from the model catalog (static capability metadata, not an API
+ *    reading).
+ *
+ * `cost` is left unset: the engine tracks tokens, not prices, and a
+ * fabricated amount is worse for a client than an absent one.
+ */
+export function agentStatusToUsageUpdate(
+  sessionId: string,
+  event: AgentStatusUpdatedEvent,
+): SessionNotification | null {
+  const used = event.contextTokens;
+  const size = event.maxContextTokens;
+  if (used === undefined || size === undefined || size <= 0) return null;
+  const turn = event.usage?.currentTurn;
+  const total = event.usage?.total;
+  const meta: AcpUsageUpdateMeta = {
+    model: event.model,
+    usage: turn === undefined ? undefined : tokenUsageToAcpUsage(turn),
+    sessionUsage: total === undefined ? undefined : tokenUsageToAcpUsage(total),
+  };
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: 'usage_update',
+      used,
+      size,
+      _meta: { ...meta },
     },
   };
 }

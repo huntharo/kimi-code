@@ -28,6 +28,7 @@ import type {
   SessionModeState,
   SessionNotification,
   ToolCallLocation,
+  Usage,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
 import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
@@ -41,6 +42,7 @@ import type {
   SessionEventPayloads,
   SessionHandle,
   SkillSummary,
+  UsageStatus,
 } from '@moonshot-ai/klient';
 import type {
   ToolCallDeltaEvent,
@@ -69,6 +71,7 @@ import {
   planFromDisplayBlock,
   sessionInfoUpdateNotification,
   thinkingDeltaToSessionUpdate,
+  tokenUsageToAcpUsage,
   toolCallDeltaToSessionUpdate,
   toolCallLazyCreateToSessionUpdate,
   toolCallLocations,
@@ -80,6 +83,7 @@ import {
   usageUpdateNotification,
   isAuthError,
   stringifyArgs,
+  type AcpUsageUpdateMeta,
 } from './events-map';
 import { AcpInteractionBridge } from './interaction-bridge';
 import { log } from './log';
@@ -238,6 +242,33 @@ export class AcpSession {
   private readonly terminalBackedCalls = new Map<string, string>();
   /** Bridges engine approval / ask-user requests to the ACP client. */
   private readonly interactionBridge: AcpInteractionBridge;
+  /**
+   * Latest token-accounting slices folded out of `agent.status.updated`.
+   *
+   * The engine publishes this event one slice at a time — `contextTokens`
+   * when a measured anchor lands, `usage` when a model call's provider-
+   * reported counters are recorded, `maxContextTokens` when a model binds —
+   * so a single event is never a complete picture. Keeping the last value of
+   * each slice here is what lets a `usage_update` be assembled synchronously,
+   * with no RPC round trip per model call.
+   */
+  private readonly tokenStatus: {
+    contextTokens?: number;
+    maxContextTokens?: number;
+    usage?: UsageStatus;
+  } = {};
+  /**
+   * Last `usage_update` payload pushed to the client, as a JSON key. Status
+   * events fire for every slice and several carry no token change at all, so
+   * without this the client would receive runs of identical meter updates.
+   */
+  private lastUsageUpdateKey: string | undefined;
+  /**
+   * Model id whose context-window size is already resolved into
+   * {@link tokenStatus} (or is being resolved right now) — the memo that keeps
+   * {@link resolveContextWindow} to one catalog lookup per bound model.
+   */
+  private contextWindowModelId: string | undefined;
 
   constructor(
     private readonly conn: AcpClient,
@@ -310,6 +341,13 @@ export class AcpSession {
           this.onTurnEnded(event);
         });
       }),
+      // Token accounting is not turn-scoped: the status slices carry no
+      // turnId, and the engine keeps reporting after a turn settles (a
+      // background compaction rewrites the context, which moves the meter).
+      // Subscribing outside `dispatchTurnEvent` keeps those updates flowing.
+      events.on('agent.status.updated', (event) => {
+        this.onAgentStatusUpdated(event);
+      }),
       // Compaction runs as a background LLM task outside any turn, so these
       // are not turn-scoped; the subscription is already agent-grained (this
       // session's main agent), which keeps other sessions' events out.
@@ -351,6 +389,7 @@ export class AcpSession {
     try {
       this.currentModelId = await this.agent.getModel();
       this.currentThinkingLevel = await this.agent.getThinking();
+      await this.resolveContextWindow();
     } catch (error) {
       // Keep the unbound defaults — configOptions stays honest.
       log.warn('acp: could not seed model/thinking state', {
@@ -915,26 +954,132 @@ export class AcpSession {
         driver.reject(RequestError.authRequired(undefined, error?.message));
         return;
       }
-      driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
+      driver.resolve({
+        stopReason: turnEndReasonToStopReason(event.reason, error),
+        // The turn's provider-reported token total, so a client that ignores
+        // the streaming `usage_update` notifications still gets the turn's
+        // cost once. Turn-scoped, not session-cumulative — the engine resets
+        // `currentTurn` at every turn boundary.
+        usage: this.turnUsage(),
+      });
     });
     void this.emitUsageUpdate();
   }
 
   /**
-   * Push a one-shot `usage_update` after a turn settles: `used` = the agent's
-   * current context token count, `size` = the bound model's max context size
-   * from the catalog. Skipped while no catalog model matches the bound id —
-   * there is nothing honest to report. `cost` stays omitted (the engine has
-   * no cost data).
+   * Fold one `agent.status.updated` slice into {@link tokenStatus} and push a
+   * fresh `usage_update` when the result differs from the last one sent.
+   *
+   * The engine emits a slice after every model call (provider-reported
+   * `usage`, then the measured `contextTokens` anchor), which is what makes
+   * the meter and the running spend figure live during a long turn rather
+   * than a single reading at turn end.
+   */
+  private onAgentStatusUpdated(event: AgentEventPayloads['agent.status.updated']): void {
+    const slice = event as {
+      readonly contextTokens?: unknown;
+      readonly maxContextTokens?: unknown;
+      readonly usage?: UsageStatus;
+    };
+    if (typeof slice.contextTokens === 'number') {
+      this.tokenStatus.contextTokens = slice.contextTokens;
+    }
+    if (typeof slice.maxContextTokens === 'number') {
+      this.tokenStatus.maxContextTokens = slice.maxContextTokens;
+    }
+    if (slice.usage !== undefined) this.tokenStatus.usage = slice.usage;
+    // The context limit rides the profile slice, which the engine publishes
+    // when a model binds — normally before this session subscribed. Resolve it
+    // from the catalog instead of waiting for a slice that will not come again.
+    if (this.tokenStatus.maxContextTokens === undefined) void this.resolveContextWindow();
+    this.emitUsageUpdateFromStatus();
+  }
+
+  /**
+   * Resolve the bound model's context-window size from the catalog into
+   * {@link tokenStatus}, once per model id, and repaint the meter if that
+   * completed the picture. Best-effort: a lookup failure clears the memo so a
+   * later slice retries, and leaves the meter unpublished rather than guessing
+   * a window size.
+   */
+  private async resolveContextWindow(): Promise<void> {
+    const modelId = this.currentModelId;
+    if (modelId === '' || modelId === this.contextWindowModelId) return;
+    this.contextWindowModelId = modelId;
+    // Drop the previous model's window rather than publishing it against the
+    // new model for the length of the lookup.
+    this.tokenStatus.maxContextTokens = undefined;
+    try {
+      const size = (await this.klient.global.kosong.listModels()).find(
+        (item) => item.model === modelId,
+      )?.max_context_size;
+      if (size === undefined || size <= 0) return;
+      this.tokenStatus.maxContextTokens = size;
+      this.emitUsageUpdateFromStatus();
+    } catch (error) {
+      this.contextWindowModelId = undefined;
+      log.warn('acp: could not resolve the model context window', {
+        sessionId: this.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** The current turn's running token total, in ACP shape. */
+  private turnUsage(): Usage | undefined {
+    const turn = this.tokenStatus.usage?.currentTurn;
+    return turn === undefined ? undefined : tokenUsageToAcpUsage(turn);
+  }
+
+  private usageUpdateMeta(): AcpUsageUpdateMeta {
+    const total = this.tokenStatus.usage?.total;
+    return {
+      model: this.currentModelId === '' ? undefined : this.currentModelId,
+      usage: this.turnUsage(),
+      sessionUsage: total === undefined ? undefined : tokenUsageToAcpUsage(total),
+    };
+  }
+
+  /**
+   * Emit a `usage_update` built purely from the accumulated status slices —
+   * synchronous, so it can run on every model call without an RPC round trip.
+   * Returns false when the slices do not yet describe a context window: ACP's
+   * `size` is a required number with no "unknown" encoding, so a missing limit
+   * (no model bound yet) must not be published as a `0` window that renders as
+   * a full or broken meter.
+   */
+  private emitUsageUpdateFromStatus(): boolean {
+    const used = this.tokenStatus.contextTokens;
+    const size = this.tokenStatus.maxContextTokens;
+    if (used === undefined || size === undefined || size <= 0) return false;
+    const notification = usageUpdateNotification(this.sessionId, used, size, this.usageUpdateMeta());
+    const key = JSON.stringify(notification.update);
+    if (key === this.lastUsageUpdateKey) return true;
+    this.lastUsageUpdateKey = key;
+    this.emit(notification);
+    return true;
+  }
+
+  /**
+   * Push a `usage_update` after a turn settles. Normally the status slices
+   * already carry everything and this is a no-op (the dedupe suppresses the
+   * repeat). The RPC fallback below covers the case where no
+   * `maxContextTokens` slice was ever observed — a session resumed onto an
+   * already-bound model never re-publishes the profile slice — by reading the
+   * context size and the catalog's max context size directly. Skipped when no
+   * catalog model matches the bound id: there is nothing honest to report.
    */
   private async emitUsageUpdate(): Promise<void> {
+    if (this.emitUsageUpdateFromStatus()) return;
     try {
       const size = (await this.klient.global.kosong.listModels()).find(
         (item) => item.model === this.currentModelId,
       )?.max_context_size;
       if (size === undefined) return;
       const context = await this.agent.getContext();
-      this.emit(usageUpdateNotification(this.sessionId, context.tokenCount, size));
+      this.tokenStatus.maxContextTokens = size;
+      this.tokenStatus.contextTokens = context.tokenCount;
+      this.emitUsageUpdateFromStatus();
     } catch (error) {
       log.warn('acp: failed to push usage_update', {
         sessionId: this.sessionId,
@@ -1053,6 +1198,8 @@ export class AcpSession {
     // Update BEFORE resolving the on-effort so a merged `,thinking` switch
     // picks the NEW model's default level, not the old one's.
     this.currentModelId = baseId;
+    // The new model's window replaces the old one's in the meter.
+    void this.resolveContextWindow();
     if (hasSuffix) {
       const models = projectModelCatalog(await this.klient.global.kosong.listModels());
       const level = models.find((model) => model.id === baseId)?.defaultThinkingEffort ?? 'on';

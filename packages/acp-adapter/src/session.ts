@@ -7,6 +7,7 @@ import {
   type ModelId,
   type PromptResponse,
   type SessionModeId,
+  type Usage,
 } from '@agentclientprotocol/sdk';
 import {
   ErrorCodes,
@@ -42,11 +43,13 @@ import { listModelsFromHarness } from './model-catalog';
 import { acpBlocksToPromptParts, compressPromptImageParts } from './convert';
 import {
   acpToolCallId,
+  agentStatusToUsageUpdate,
   assistantDeltaToSessionUpdate,
   configOptionUpdateNotification,
   planFromDisplayBlock,
   stringifyArgs,
   thinkingDeltaToSessionUpdate,
+  tokenUsageToAcpUsage,
   toolCallDeltaToSessionUpdate,
   toolCallLazyCreateToSessionUpdate,
   toolCallStartedUpgradeToSessionUpdate,
@@ -787,6 +790,16 @@ export class AcpSession {
    * client. Resolves with the ACP `PromptResponse` (containing
    * `stopReason`) when a `turn.ended` event arrives.
    *
+   * Token accounting rides the same subscription. Each `agent.status.updated`
+   * carries the engine's folded status snapshot — provider-reported token
+   * counters plus the current context size — and becomes a `usage_update`
+   * `session/update`, so a client can paint a live context meter and a
+   * running spend figure while a long turn is still executing. The turn's
+   * final running total is also returned on `PromptResponse.usage` for
+   * clients that only read the response. Both are scoped to the TURN, not
+   * the session; the session-cumulative total rides along under
+   * `usage_update._meta.sessionUsage`.
+   *
    * Cleanup invariants:
    *  - The event subscription is unsubscribed on EVERY exit path
    *    (success, cancel, failed turn, and `session.prompt()` rejection).
@@ -1019,6 +1032,18 @@ export class AcpSession {
       // each turn produces a distinct wire-level tool call that needs
       // its own CREATE.
       const startedToolCalls = new Set<string>();
+      // Running token total for THIS turn, refreshed from every
+      // `agent.status.updated` slice the engine folds a usage snapshot
+      // into (one lands after each model call completes). Reported back
+      // on the `PromptResponse` so a client that ignores the streaming
+      // `usage_update` notifications still gets the turn's cost once.
+      let turnUsage: Usage | undefined;
+      // Last `usage_update` payload pushed to the client, as a JSON key.
+      // Status events fire for every slice (plan mode, permission mode,
+      // phase …) and each carries the same folded context snapshot, so
+      // without this the client would receive long runs of identical
+      // meter updates.
+      let lastUsageUpdateKey: string | undefined;
       const initialActiveTurnId = this.currentTurnId;
       let hasReceivedOwnTurnStarted = false;
       const unsub = this.session.onEvent((event) => {
@@ -1065,6 +1090,23 @@ export class AcpSession {
               event.message,
             ),
           );
+          return;
+        }
+        if (event.type === 'agent.status.updated') {
+          if (!isFromMainAgent(event)) return;
+          const turn = event.usage?.currentTurn;
+          if (turn !== undefined) turnUsage = tokenUsageToAcpUsage(turn);
+          const note = agentStatusToUsageUpdate(sessionId, event);
+          if (note === null) return;
+          const key = JSON.stringify(note.update);
+          if (key === lastUsageUpdateKey) return;
+          lastUsageUpdateKey = key;
+          conn.sessionUpdate(note).catch((err) => {
+            log.warn('acp: failed to push usage_update', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
           return;
         }
         if (event.type === 'assistant.delta') {
@@ -1269,7 +1311,10 @@ export class AcpSession {
             this.currentTurnId = undefined;
             unsub();
           }
-          resolve({ stopReason: turnEndReasonToStopReason(event.reason, event.error) });
+          resolve({
+            stopReason: turnEndReasonToStopReason(event.reason, event.error),
+            usage: turnUsage,
+          });
         }
       });
 

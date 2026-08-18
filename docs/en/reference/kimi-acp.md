@@ -53,7 +53,7 @@ The spec divides methods into a **stable** surface and an evolving **unstable** 
 
 | Method | Implemented | Description |
 | --- | --- | --- |
-| `session/update` | Yes | Streams `agent_message_chunk` / `tool_call*` / `plan` / `config_option_update` / `available_commands_update` |
+| `session/update` | Yes | Streams `agent_message_chunk` / `tool_call*` / `plan` / `config_option_update` / `available_commands_update` / `usage_update` |
 | `session/request_permission` | Yes | Shared channel for tool approval and question elicitation |
 | `fs/read_text_file` | Yes | File reads at the kaos layer are routed to the client (advertised via `fsCapabilities`) |
 | `fs/write_text_file` | Yes | File writes at the kaos layer are routed to the client |
@@ -67,6 +67,21 @@ The spec divides methods into a **stable** surface and an evolving **unstable** 
 | Remaining 18 methods | No | Includes session lifecycle extensions, buffer sync, inline-edit prediction, provider management, etc. |
 
 All methods not listed above return `methodNotFound`.
+
+## Token Usage Reporting
+
+The numbers are the model API's own counters — kimi reports what the provider returned, not a local estimate.
+
+While a turn runs, each completed model call pushes a `usage_update` `session/update`:
+
+- `used` / `size` — tokens currently in context and the bound model's context-window size, for a live context meter.
+- `_meta.usage` — the running token total for the **current turn** (`inputTokens`, `outputTokens`, `cachedReadTokens`, `cachedWriteTokens`, `totalTokens`), in ACP's `Usage` shape. It resets at every turn boundary.
+- `_meta.sessionUsage` — the same breakdown accumulated since the session was created.
+- `_meta.model` — the model the counters were charged against.
+
+`cost` is never set: kimi tracks tokens, not prices.
+
+When the turn settles, the `session/prompt` response carries the turn's final total on `usage`, so a client that ignores the streaming notifications still gets one reading per turn.
 
 ## MCP Forwarding
 
